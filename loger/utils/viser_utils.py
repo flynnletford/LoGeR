@@ -11,7 +11,7 @@ from tqdm.auto import tqdm
 import viser
 import viser.transforms as vt
 import cv2
-import matplotlib.cm as cm
+import matplotlib
 
 try:
     import onnxruntime
@@ -149,6 +149,19 @@ def setup_camera_follow(
     return stop_camera_follow, resume_camera_follow
 
 
+def umeyama_sim3_align(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """Return src (N,3) mapped onto dst (N,3) by the least-squares Sim3 (Umeyama)."""
+    mu_src, mu_dst = src.mean(0), dst.mean(0)
+    src_c, dst_c = src - mu_src, dst - mu_dst
+    U, D, Vt = np.linalg.svd(dst_c.T @ src_c / len(src))
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[2, 2] = -1
+    R = U @ S @ Vt
+    scale = np.trace(np.diag(D) @ S) / src_c.var(0).sum()
+    return scale * src_c @ R.T + mu_dst
+
+
 def viser_wrapper(
     pred_dict: dict,
     port: int = 8080,
@@ -161,6 +174,8 @@ def viser_wrapper(
     share: bool = False,
     point_size: float = 0.001,
     canonical_first_frame: bool = True,  # Use first frame as canonical (identity pose)
+    gt_poses: str | None = None,  # KITTI-format GT pose file, shown Sim3-aligned to the estimate
+    record_mp4: str | None = None,  # Save a 60 FPS follow-cam playback to this MP4 and exit
 ):
     """Visualize predictions using Viser.
 
@@ -286,6 +301,7 @@ def viser_wrapper(
         gui_point_size = server.gui.add_slider("Point Size", 0.0001, 0.05, 0.0001, point_size)
         gui_camera_size = server.gui.add_slider("Camera Size", 0.01, 0.3, 0.01, 0.03)
         gui_camera_follow = server.gui.add_checkbox("Camera Follow Cam0", False)
+        gui_drop_behind = server.gui.add_checkbox("Drop Points Behind Camera", False)
         gui_camera_follow_lag = server.gui.add_slider("Follow Lag (frames)", 0, min(30, max(0, S - 1)), 1, min(10, max(0, S - 1)))
         gui_camera_follow_backoff = server.gui.add_slider("Follow Backoff", 0.0, 3.0, 0.01, 0.25)
         gui_camera_follow_ema = server.gui.add_slider("Follow EMA Alpha", 0.001, 1.0, 0.001, 0.05)
@@ -405,33 +421,66 @@ def viser_wrapper(
         fov=60.0,
     )
 
+    # ───────────── GT vs Estimated Trajectory ─────────────
+    if gt_poses is not None:
+        gt_positions = np.loadtxt(gt_poses).reshape(-1, 3, 4)[:, :, 3]
+        n = min(len(gt_positions), S)
+        est_positions = cam0_positions[:n].astype(np.float64)
+        gt_aligned = umeyama_sim3_align(gt_positions[:n], est_positions)
+        print(f"GT trajectory: {n} frames, ATE RMSE in estimate units: "
+              f"{np.sqrt(np.mean(np.sum((gt_aligned - est_positions) ** 2, axis=1))):.4f}")
+
+        def as_segments(p):
+            return np.stack([p[:-1], p[1:]], axis=1).astype(np.float32)
+
+        gt_line = server.scene.add_line_segments(
+            "/traj_gt", as_segments(gt_aligned), colors=(0, 200, 0), line_width=3.0)
+        est_line = server.scene.add_line_segments(
+            "/traj_est", as_segments(est_positions), colors=(220, 0, 0), line_width=3.0)
+        gui_show_traj = server.gui.add_checkbox("Show GT (green) / Est (red) trajectory", True)
+
+        @gui_show_traj.on_update
+        def _(_) -> None:
+            gt_line.visible = gui_show_traj.value
+            est_line.visible = gui_show_traj.value
+
+    def frame_points(cam_id, i):
+        current_conf = conf_data[cam_id][i]
+        current_xyz_c = xyz_centered_data[cam_id][i]
+        current_img = img_data[cam_id][i]
+
+        if gui_show_cams[cam_id].value:
+            mask = gen_mask(current_conf, gui_conf.value)
+            # Reshape arrays for masking: (H,W,3) -> (H*W,3) and (H,W) -> (H*W,)
+            pts_flat = current_xyz_c.reshape(-1, 3)
+            mask_flat = mask.reshape(-1)
+            rgb_img_for_pts = current_img
+            if rgb_img_for_pts.max() <= 1.0: rgb_img_for_pts = rgb_img_for_pts * 255
+            rgb_flat = rgb_img_for_pts.astype(np.uint8).reshape(-1, 3)
+
+            # Apply mask
+            pts = pts_flat[mask_flat]
+            rgb = rgb_flat[mask_flat]
+        else:
+            pts = np.zeros((0,3), np.float32)
+            rgb = np.zeros((0,3), np.uint8)
+        return pts, rgb
+
     print("Building frames / point clouds …")
     for i in tqdm(range(S)):
         f_root_timestep = server.scene.add_frame(f"/frames/t{i}", show_axes=False)
 
         for cam_id in cam_ids:
             frames_roots[cam_id].append(f_root_timestep)
+            if record_mp4 is not None:
+                # Record mode streams point clouds frame by frame (see Record MP4); frustums stay hidden.
+                pcd_handles[cam_id].append(None)
+                frustums[cam_id].append(None)
+                continue
 
             # Point Cloud
-            current_conf = conf_data[cam_id][i]
-            current_xyz_c = xyz_centered_data[cam_id][i]
             current_img = img_data[cam_id][i]
-
-            if gui_show_cams[cam_id].value:
-                mask = gen_mask(current_conf, gui_conf.value)
-                # Reshape arrays for masking: (H,W,3) -> (H*W,3) and (H,W) -> (H*W,)
-                pts_flat = current_xyz_c.reshape(-1, 3)
-                mask_flat = mask.reshape(-1)
-                rgb_img_for_pts = current_img
-                if rgb_img_for_pts.max() <= 1.0: rgb_img_for_pts = rgb_img_for_pts * 255
-                rgb_flat = rgb_img_for_pts.astype(np.uint8).reshape(-1, 3)
-                
-                # Apply mask
-                pts = pts_flat[mask_flat]
-                rgb = rgb_flat[mask_flat]
-            else:
-                pts = np.zeros((0,3), np.float32)
-                rgb = np.zeros((0,3), np.uint8)
+            pts, rgb = frame_points(cam_id, i)
 
             pcd_handle  = server.scene.add_point_cloud(
                 f"/frames/t{i}/pc_{cam_id}", pts, rgb, point_size=point_size*(subsample**(1/2)), point_shape="rounded"
@@ -440,7 +489,7 @@ def viser_wrapper(
 
             # Frustum
             norm_i = i/(S-1) if S>1 else 0.0
-            col   = cm.get_cmap('gist_rainbow')(norm_i)[:3]
+            col   = matplotlib.colormaps['gist_rainbow'](norm_i)[:3]
             
             # Since Pi3 doesn't provide intrinsics, we have to use a heuristic for FOV.
             # This is a limitation. A fixed FOV is a reasonable fallback.
@@ -468,6 +517,17 @@ def viser_wrapper(
             )
             frustums[cam_id].append(frustum_handle)
 
+    # ───────────── Drop Points Behind Camera ─────────────
+    def is_behind(j, t):
+        """True if frame j's camera centre is behind the viewer at frame t (the follow-cam pose when following)."""
+        if gui_camera_follow.value:
+            r = max(0, t - gui_camera_follow_lag.value)
+            viewer_pos = cam0_positions[r] - cam0_forward[r] * gui_camera_follow_backoff.value
+        else:
+            r = t
+            viewer_pos = cam0_positions[r]
+        return float(np.dot(cam0_positions[j] - viewer_pos, cam0_forward[r])) < 0.0
+
     # ───────────── Update Visibility ─────────────
     def set_visibility():
         show_all_ts = gui_all.value
@@ -484,6 +544,8 @@ def viser_wrapper(
                 vis_timestep_level = (i % stride_ts == 0) and in_range
             elif accumulate_on_play:
                 vis_timestep_level = (start_f <= i <= current_ts) and (((i - start_f) % stride_ts) == 0) and in_range
+                if vis_timestep_level and gui_drop_behind.value and is_behind(i, current_ts):
+                    vis_timestep_level = False
             else:
                 vis_timestep_level = (i == current_ts) and in_range
             
@@ -596,6 +658,10 @@ def viser_wrapper(
     def _(_):
         set_visibility()
 
+    @gui_drop_behind.on_update
+    def _(_):
+        set_visibility()
+
     @gui_start_frame.on_update
     def _(_): set_visibility()
     
@@ -667,6 +733,52 @@ def viser_wrapper(
     def _(_):
         if gui_camera_follow.value:
             gui_frame.value = gui_frame.value
+
+    # ───────────── Record MP4 ─────────────
+    # Frames are rendered by a connected browser tab (viser has no server-side renderer).
+    if record_mp4 is not None:
+        print(f"Recording: open http://localhost:{port} in a browser and keep the tab open.")
+        while not server.get_clients():
+            time.sleep(0.5)
+        client = next(iter(server.get_clients().values()))
+        time.sleep(1.0)  # let the browser receive the scene before the first render
+
+        gui_fps.value = 60.0
+        gui_point_size.value = 0.0015
+        gui_show_all_cams_master.value = False
+        gui_play.value = True  # accumulate only applies while playing
+        gui_accumulate_play.value = True
+        gui_stride.value = 1
+        gui_camera_follow.value = True
+        gui_drop_behind.value = True
+
+        os.makedirs(os.path.dirname(os.path.abspath(record_mp4)), exist_ok=True)
+        writer = None
+        live = []  # frames whose point clouds are currently in the browser
+        for i in tqdm(range(S), desc="Recording"):
+            # Stream this frame's points in; with drop enabled, remove frames now behind the viewer
+            # so browser memory stays bounded instead of holding the whole sequence.
+            for cam_id in cam_ids:
+                pts, rgb = frame_points(cam_id, i)
+                pcd_handles[cam_id][i] = server.scene.add_point_cloud(
+                    f"/frames/t{i}/pc_{cam_id}", pts, rgb, point_size=gui_point_size.value, point_shape="rounded"
+                )
+            live.append(i)
+            gui_frame.value = i  # updates visibility and the follow camera
+            if gui_drop_behind.value:
+                for j in [j for j in live if is_behind(j, i)]:
+                    for cam_id in cam_ids:
+                        pcd_handles[cam_id][j].remove()
+                        pcd_handles[cam_id][j] = None
+                    live.remove(j)
+            frame = client.get_render(height=720, width=1280, timeout=60.0)
+            if writer is None:
+                h, w = frame.shape[:2]
+                writer = cv2.VideoWriter(record_mp4, cv2.VideoWriter_fourcc(*"mp4v"), gui_fps.value, (w, h))
+            writer.write(cv2.cvtColor(frame[..., :3], cv2.COLOR_RGB2BGR))
+        writer.release()
+        print(f"Saved {S} frames to {record_mp4}")
+        return server
 
     # ───────────── Playback Loop ─────────────
     def loop():
