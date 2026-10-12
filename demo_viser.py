@@ -115,6 +115,8 @@ parser.add_argument("--sim3", action="store_true", help="Use sim3 transformation
 parser.add_argument("--sim3_scale_mode", type=str, default="median", choices=["median", "trimmed_mean", "median_all", "trimmed_mean_all", "sim3_avg1"], help="Scale estimation mode for Sim3.")
 parser.add_argument("--reset_every", type=int, default=None, help="Reset TTT / adapter state every N windows (0 disables).")
 parser.add_argument("--output_txt", type=str, default=None, help="Output trajectory txt file path.")
+parser.add_argument("--record_mp4", type=str, default=None, help="Instead of serving interactively, record a 60 FPS camera-follow playback to this MP4 (needs the viewer open in a browser) and exit.")
+parser.add_argument("--gt_poses", type=str, default=None, help="KITTI-format GT pose file (12 values per line, one line per frame from frame 0) to show Sim3-aligned next to the estimated trajectory.")
 parser.add_argument("--se3", action="store_true", default=None, help="Use se3 transformation for TTT. If omitted, fallback to config value, then False.")
 parser.add_argument("--no_ttt", action="store_true", help="Disable TTT.")
 parser.add_argument("--no_swa", action="store_true", help="Disable SWA.")
@@ -740,6 +742,8 @@ def main():
         video_width=args.video_width,
         share=args.share,
         canonical_first_frame=args.canonical_first_frame,
+        gt_poses=args.gt_poses,
+        record_mp4=args.record_mp4,
     )
     
     for temp_dir_path in temp_frame_dirs.values():

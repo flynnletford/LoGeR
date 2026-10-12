@@ -2,3 +2,18 @@ __pycache__/
 results*/
 convert_ckpt_to_params.py
 *.pt
+
+# Cluster run artefacts (results, data and videos are symlinks into scratch)
+cluster/logs/
+results
+videos
+data/kitti
+eval/long_eval_script/kitti_benchmark
+eval/long_eval_script/vbr_benchmark
+
+# Media (already-tracked files such as data/examples/ stay tracked)
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.svg
